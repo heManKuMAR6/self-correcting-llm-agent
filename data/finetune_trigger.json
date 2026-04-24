@@ -1,0 +1,7 @@
+{
+  "trigger": "finetune",
+  "dpo_pairs": 10,
+  "dataset_path": "data/finetuning_records.jsonl",
+  "status": "ready_for_training",
+  "next_step": "python3 scripts/finetune_lora.py"
+}

@@ -1,3 +1,24 @@
+# agents/correction_agent.py
+
+"""
+CORRECTION AGENT — GPT-4o-mini fixes what Claude flagged.
+
+Receives:
+- Original prompt
+- Failed response
+- Specific correction instructions from Claude
+
+Produces:
+- Corrected response that addresses every failure
+- DPO training record saved automatically
+
+The separation matters:
+Claude catches the errors.
+GPT fixes them.
+Claude re-evaluates the fix.
+Nobody grades their own work.
+"""
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -7,54 +28,73 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from core.state import AgentState
 
+# GPT-4o-mini as corrector — different from Claude evaluator
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 
+# How many DPO pairs before fine-tuning trigger
+FINETUNE_TRIGGER_COUNT = 10
+
+
 def correction_agent(state: AgentState) -> AgentState:
-    """
-    In production this would trigger actual LoRA fine-tuning.
-    Here we simulate the correction by:
-    1. Generating an improved response using the feedback
-    2. Saving a fine-tuning data record (prompt/response pair)
-    3. Returning the corrected response for re-evaluation
+    print(f"\n[Correction Agent — GPT-4o-mini] Applying corrections (iteration {state['iteration']})...")
 
-    WHY simulate?
-    Real LoRA fine-tuning takes hours on GPU hardware.
-    But the architecture is identical — in production you'd
-    swap the correction step with a Hugging Face PEFT training call.
-    The agent orchestration, feedback loop, and evaluation remain exactly the same.
-    """
+    scores = state["evaluation_scores"]
 
-    print(f"\n[Correction Agent] Applying corrections...")
+    # Build failure summary for context
+    failures = []
+    if scores.get("factuality", 1) < 0.7:
+        failures.append(
+            f"Factuality failed ({scores.get('factuality', 0):.2f}) — contains incorrect facts"
+        )
+    if scores.get("safety", 1) < 0.8:
+        failures.append(
+            f"Safety failed ({scores.get('safety', 0):.2f}) — contains harmful content"
+        )
+    if scores.get("quality", 1) < 0.7:
+        failures.append(
+            f"Quality failed ({scores.get('quality', 0):.2f}) — unclear or incomplete"
+        )
+
+    failure_summary = "\n".join(failures) if failures else "General quality improvement needed"
 
     messages = [
         SystemMessage(content="""You are an expert at improving LLM responses.
-Using the correction feedback provided, generate an improved response
-that addresses all identified issues."""),
+You receive a response that failed quality evaluation.
+Your job is to rewrite it to be factually accurate, safe, and high quality.
+Address every specific issue mentioned in the correction instructions.
+Write ONLY the corrected response. No preamble, no explanation."""),
 
-        HumanMessage(content=f"""Original Prompt: {state['prompt']}
+        HumanMessage(content=f"""Original Prompt:
+{state['prompt']}
 
-Original Response: {state['response']}
+Failed Response:
+{state['response']}
 
-Correction Feedback: {state['correction_feedback']}
+Quality failures:
+{failure_summary}
 
-Generate an improved response that:
-1. Fixes all identified issues
-2. Maintains factual accuracy
-3. Ensures safety and neutrality
-4. Improves clarity and quality""")
+Specific correction instructions:
+{state['correction_feedback']}
+
+Evaluator reasoning: {scores.get('reasoning', 'Not provided')}
+
+Write the corrected response now.
+Fix ALL identified issues.
+Be factually accurate, safe, and clear.""")
     ]
 
     result = llm.invoke(messages)
     corrected_response = result.content
 
-    # Save fine-tuning data record
-    # In production: this feeds into LoRA training pipeline
+    # Save DPO training record
     os.makedirs("data", exist_ok=True)
     ft_record = {
         "prompt": state["prompt"],
         "rejected": state["response"],
         "chosen": corrected_response,
         "feedback": state["correction_feedback"],
+        "failures": failures,
+        "scores_before": scores,
         "iteration": state["iteration"]
     }
 
@@ -62,11 +102,36 @@ Generate an improved response that:
     with open(ft_path, "a") as f:
         f.write(json.dumps(ft_record) + "\n")
 
-    print(f"[Correction Agent] Improved response generated")
-    print(f"[Correction Agent] Fine-tuning record saved to {ft_path}")
+    # Count total records
+    with open(ft_path, "r") as f:
+        record_count = sum(1 for line in f if line.strip())
+
+    print(f"[Correction Agent] Corrected response generated")
+    print(f"[Correction Agent] DPO record saved ({record_count} total pairs)")
+
+    # Fine-tuning trigger check
+    if record_count >= FINETUNE_TRIGGER_COUNT:
+        print(f"\n[Fine-Tune Trigger] ⚡ {record_count} DPO pairs accumulated")
+        _save_finetune_trigger(record_count, ft_path)
 
     return {
         "response": corrected_response,
         "iteration": state["iteration"] + 1,
         "current_agent": "correction"
     }
+
+
+def _save_finetune_trigger(count: int, path: str):
+    """Saves trigger file when enough DPO pairs accumulate."""
+    trigger = {
+        "trigger": "finetune",
+        "dpo_pairs": count,
+        "dataset_path": path,
+        "status": "ready_for_training",
+        "next_step": "python3 scripts/finetune_lora.py"
+    }
+    os.makedirs("data", exist_ok=True)
+    with open("data/finetune_trigger.json", "w") as f:
+        json.dump(trigger, f, indent=2)
+    print(f"[Fine-Tune Trigger] Saved to data/finetune_trigger.json")
+    print(f"[Fine-Tune Trigger] Run: python3 scripts/finetune_lora.py")
